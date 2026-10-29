@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Profil "central" — serveur online qui agrégera la donnée de tous les magasins.
+#
+# Activation :
+#   java -jar kidzpos-backend.jar --spring.profiles.active=central
+#   ou : SPRING_PROFILES_ACTIVE=central java -jar ...
+#
+# Hérite de application.yml. Différences vs. "local" :
+#   - port distinct par défaut (8090) pour pouvoir cohabiter avec un local
+#     pendant le développement.
+#   - datasource distincte (DB "kidzpos_central" par défaut).
+#
+# IMPORTANT : ce profil ne change PAS encore le comportement applicatif.
+# Les endpoints /api/sync (ETAPE 4) sont exposés des deux côtés ; c'est la
+# couche métier de synchro (future PR) qui distinguera les rôles.
+# ─────────────────────────────────────────────────────────────────────────────
+
+server:
+  port: ${SERVER_PORT:8090}
+
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:kidzpos_central}
+    username: ${DB_USER:kidzpos}
+    password: ${DB_PASSWORD:kidzpos}
+
+kidzpos:
+  node:
+    role: central
+    id: ${KIDZPOS_NODE_ID:central-default}
+    # V18 — Le central ne sert PAS un magasin spécifique : il agrège.
+    # Laisser vide → NodeContext.isStoreScoped()=false → comportement
+    # rétrocompatible (pas de tag store_id sur les rares opérations qui
+    # pourraient y être journalisées localement, et pas de garde cross-store).
+    store-id: ${KIDZPOS_NODE_STORE_ID:}
+  # Le central RECOIT les push : push.enabled reste false (il ne push pas).
+  # `inbound.api-key` doit être fourni via env pour activer l'auth par API-KEY ;
+  # sinon seul un appel JWT ROLE_ADMIN sera accepté sur /api/sync/push.
+  sync:
+    push:
+      enabled: false
+    inbound:
+      api-key: ${KIDZPOS_SYNC_INBOUND_API_KEY:}
+    # Purge périodique d'operation_log côté central — évite la croissance
+    # illimitée (1 ligne par mutation × N stores). Garde 90 jours par défaut,
+    # configurable. Le job n'est instancié QUE si enabled=true (cf
+    # @ConditionalOnProperty sur OperationLogCleanupJob).
+    #
+    # IMPORTANT : ne supprime que les events synced=true. Les events en attente
+    # de sync sont préservés indépendamment de leur âge (audit + idempotence).
+    cleanup:
+      enabled: ${KIDZPOS_SYNC_CLEANUP_ENABLED:true}
+      retention-days: ${KIDZPOS_SYNC_CLEANUP_RETENTION_DAYS:90}
+      batch-size: ${KIDZPOS_SYNC_CLEANUP_BATCH_SIZE:1000}
+      interval-ms: ${KIDZPOS_SYNC_CLEANUP_INTERVAL_MS:3600000}
+      initial-delay-ms: ${KIDZPOS_SYNC_CLEANUP_INITIAL_DELAY_MS:600000}

@@ -1,0 +1,78 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Caddyfile — KidzPOS central en PRODUCTION (vraie VM publique, vrai domaine).
+#
+# Caddy fait DEUX choses sous la MÊME origine HTTPS :
+#   1. Sert le frontend statique (/srv/kidzpos/dist) → SPA React
+#   2. Reverse-proxy /api/* /actuator/* /v3/api-docs/* → backend loopback:8080
+#
+# Cert TLS : Let's Encrypt automatique (vrai cert public, pas tls internal),
+# car le domaine est public. Aucun setup de CA côté clients.
+#
+# Variable d'env (depuis /etc/default/caddy ou systemd) :
+#   DOMAIN   nom de domaine (ex: central.tondomaine.com)
+#
+# Déployé par ops/deploy/deploy.sh dans /etc/caddy/Caddyfile.
+# ─────────────────────────────────────────────────────────────────────────────
+{
+	# email pour Let's Encrypt (renouvellements, alertes expiration). Optionnel
+	# mais recommandé. Surcharger via env CADDY_ACME_EMAIL.
+	email {$CADDY_ACME_EMAIL:admin@kidzpos.local}
+}
+
+{$DOMAIN} {
+	encode gzip zstd
+
+	# ── En-têtes de sécurité ────────────────────────────────────────────────
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Spring envoie déjà CSP/X-XSS-Protection sur /api ; Caddy les laisse passer.
+	}
+
+	# ── API + SSE + sync (push/pull/keys) ──────────────────────────────────
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080 {
+			flush_interval -1
+			transport http {
+				read_timeout 24h
+				write_timeout 24h
+			}
+		}
+	}
+
+	# ── Actuator (health, prometheus) ──────────────────────────────────────
+	handle /actuator/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# ── OpenAPI / Swagger ──────────────────────────────────────────────────
+	handle /v3/api-docs* {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle /swagger-ui* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# ── SPA React ──────────────────────────────────────────────────────────
+	handle {
+		root * /srv/kidzpos/dist
+		try_files {path} /index.html
+		file_server
+
+		@index path / /index.html
+		header @index Cache-Control "no-cache"
+
+		@hashed path_regexp /assets/.*\.(js|css|woff2?|svg|png|jpg|jpeg|webp|ico)$
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	log {
+		output file /var/log/caddy/kidzpos.log {
+			roll_size 50mb
+			roll_keep 10
+		}
+		format console
+	}
+}

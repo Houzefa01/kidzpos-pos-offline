@@ -1,0 +1,16 @@
+# Provisioning datasource Prometheus.
+# Auto-chargé par Grafana au boot via le mount /etc/grafana/provisioning.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST
+      manageAlerts: false  # Les alertes sont gérées par Prometheus directement

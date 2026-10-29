@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Profil "local" — serveur installé dans un magasin (mono-poste, multi-caisses).
+#
+# Activation :
+#   java -jar kidzpos-backend.jar --spring.profiles.active=local
+#   ou : SPRING_PROFILES_ACTIVE=local java -jar ...
+#
+# Hérite de application.yml (defaults). On override UNIQUEMENT :
+#   - le port (configurable via env si besoin, sinon 8080 comme aujourd'hui)
+#   - la datasource locale du magasin
+#
+# Aucune dépendance au serveur central : si le central est injoignable, le
+# magasin continue à fonctionner normalement (la synchro est asymétrique).
+# ─────────────────────────────────────────────────────────────────────────────
+
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:kidzpos}
+    username: ${DB_USER:kidzpos}
+    password: ${DB_PASSWORD:kidzpos}
+
+# Identifiant logique de ce nœud + activation du push vers le central.
+kidzpos:
+  node:
+    role: local
+    id: ${KIDZPOS_NODE_ID:local-default}
+    # V18 — Identifiant du magasin servi par ce serveur. NodeContext lit cette
+    # valeur et l'utilise pour :
+    #   - tagger toute opération journalisée (operation_log.store_id)
+    #   - passer storeId au pull (filtre côté central)
+    #   - garde-fou cross-store dans le processor d'inbox
+    # Doit matcher un store_id existant dans la table stores.
+    # NULL/vide accepté pour rétrocompat (legacy ou test) mais l'isolation
+    # multi-magasin est alors INACTIVE.
+    store-id: ${KIDZPOS_NODE_STORE_ID:}
+  # Push local → central.
+  #   - enabled=true par défaut sur ce profil (le magasin envoie vers le central).
+  #   - central-url et api-key DOIVENT être fournis via env, sinon le service
+  #     reste idle (cf SyncPushService.isConfigured()) — pas d'erreur fatale.
+  sync:
+    push:
+      enabled: ${KIDZPOS_SYNC_PUSH_ENABLED:true}
+      central-url: ${KIDZPOS_SYNC_CENTRAL_URL:}
+      api-key: ${KIDZPOS_SYNC_API_KEY:}
+    # Pull central → local activé par défaut sur le profil magasin.
+    # Tant que central-url+api-key restent vides, le service ne tente RIEN
+    # (isConfigured()=false → tick ignoré, debug only).
+    pull:
+      enabled: ${KIDZPOS_SYNC_PULL_ENABLED:true}
+      # Same env vars as push (un seul endpoint central, une seule clé partagée
+      # côté store). Sans ces lignes le pull restait silencieusement idle →
+      # events créés directement sur central (product.created, stock.transfer)
+      # n'arrivaient jamais sur les stores.
+      central-url: ${KIDZPOS_SYNC_CENTRAL_URL:}
+      api-key: ${KIDZPOS_SYNC_API_KEY:}
+    # Application des événements pull-és → métier local. Activée par défaut sur
+    # ce profil. Sans cette propriété, la table sync_inbox grossirait sans jamais
+    # être consommée. La whitelist hardcodée des handlers borne le risque.
+    inbox:
+      enabled: ${KIDZPOS_SYNC_INBOX_ENABLED:true}

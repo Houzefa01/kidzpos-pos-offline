@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!--
+      Pattern enrichi MDC : correlationId / userId / storeId apparaissent entre crochets
+      lorsque CorrelationIdFilter les a posés. Lisible en console, grep-friendly.
+      Pour passer à du JSON pur (Loki/ELK), ajouter logstash-logback-encoder en dépendance
+      et remplacer ce pattern par <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>.
+    -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%X{correlationId:-}] [%X{userId:-}/%X{storeId:-}] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+    <!-- Hibernate verbeux : INFO pour éviter le bruit -->
+    <logger name="org.hibernate" level="WARN"/>
+    <logger name="org.springframework.security" level="INFO"/>
+</configuration>

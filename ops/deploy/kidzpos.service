@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# kidzpos.service — Backend Spring Boot KidzPOS central
+#
+# Tourne en loopback (127.0.0.1:8080). Seul Caddy y accède en reverse proxy.
+# EnvironmentFile = secrets (mot de passe DB, JWT, API keys), jamais en git.
+# ─────────────────────────────────────────────────────────────────────────────
+[Unit]
+Description=KidzPOS backend (Spring Boot)
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=kidzpos
+Group=kidzpos
+WorkingDirectory=/srv/kidzpos
+EnvironmentFile=/srv/kidzpos/.env
+
+# RAM serrée (Oracle ARM 24Go = large, mais on plafonne pour cohabiter avec
+# Postgres). Pour Google e2-micro (1Go), passer à -Xmx384m.
+Environment="JAVA_OPTS=-Xmx768m -Xss256k -XX:MaxRAMPercentage=60 -XX:+UseG1GC"
+ExecStart=/usr/bin/java $JAVA_OPTS -jar /srv/kidzpos/bin/kidzpos-backend.jar
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Hardening systemd
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/kidzpos/logs
+StandardOutput=append:/srv/kidzpos/logs/kidzpos.log
+StandardError=append:/srv/kidzpos/logs/kidzpos.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+# Profil test : surcharge des secrets et désactive le rate-limit serré
+# qui gênerait les tests parallèles.
+
+kidzpos:
+  jwt:
+    secret: test-secret-very-long-string-for-hmac-sha-key-32-bytes-minimum
+    expiration-hours: 1
+  cors:
+    allowed-origins: "*"
+  exchange:
+    eur-to-ar-default: 4900
+
+# DataSource pris en charge par @ServiceConnection sur le container Postgres.
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+logging:
+  level:
+    com.kidzpos: INFO
+    org.hibernate.SQL: WARN

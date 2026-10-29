@@ -1,0 +1,178 @@
+# ops/docker-compose.yml — Stack OPS KidzPOS (Prometheus + Grafana + Alertmanager
+# + Postgres exporter + Node exporter).
+#
+# Le BACKEND KidzPOS tourne sur l'hôte via ./start-server.sh, PAS dans cette
+# stack. Prometheus le scrape via host.docker.internal:8080 (mapping fourni par
+# `extra_hosts: host-gateway` qui marche sur Linux et Mac/Windows).
+#
+# Lancement :   docker compose -f ops/docker-compose.yml up -d
+# Vérif :       docker compose -f ops/docker-compose.yml ps
+# Arrêt :       docker compose -f ops/docker-compose.yml down
+# Reset full :  docker compose -f ops/docker-compose.yml down -v   (⚠ purge data)
+
+name: kidzpos-ops
+
+networks:
+  ops-net:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  alertmanager_data:
+  alertmanager_bot_data:
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: kidzpos-prometheus
+    restart: always
+    user: "65534:65534"  # nobody
+    extra_hosts:
+      # Permet à Prometheus de scrape l'hôte (où tourne le backend Spring)
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"  # /-/reload sans restart
+    ports:
+      - "9090:9090"
+    networks: [ops-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: kidzpos-grafana
+    restart: always
+    user: "472:472"  # grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+      # Pas d'analytics outbound — environnement LAN
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    networks: [ops-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: kidzpos-alertmanager
+    restart: always
+    user: "65534:65534"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "9093:9093"
+    networks: [ops-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9093/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  alertmanager-bot:
+    # Pont Alertmanager → Telegram. Reçoit les webhooks d'Alertmanager,
+    # formate (template Go) et envoie au(x) chat(s) Telegram enregistré(s).
+    # Setup utilisateur :
+    #   1. Créer le bot via @BotFather  → TELEGRAM_TOKEN
+    #   2. Trouver son chat_id          → @userinfobot ou getUpdates API
+    #   3. Mettre TOKEN + ADMIN dans .env (cf ops/.env.example)
+    #   4. Lancer la stack, envoyer /start au bot depuis Telegram
+    image: metalmatze/alertmanager-bot:0.4.3
+    container_name: kidzpos-alertmanager-bot
+    restart: always
+    depends_on:
+      alertmanager:
+        condition: service_healthy
+    environment:
+      ALERTMANAGER_URL: "http://alertmanager:9093"
+      BOLT_PATH: "/data/bot.db"
+      STORE: "bolt"
+      TELEGRAM_ADMIN: "${TELEGRAM_ADMIN:?TELEGRAM_ADMIN required — chat_id de l\\'opérateur autorisé}"
+      TELEGRAM_TOKEN: "${TELEGRAM_TOKEN:?TELEGRAM_TOKEN required — get from @BotFather}"
+      LISTEN_ADDR: "0.0.0.0:8080"
+      # Templates : on utilise les defaults intégrés au bot (français + français
+      # via env LANG si besoin). Format : titre + status + summary + description
+      # + runbook_url + link to Alertmanager UI.
+      TEMPLATE_PATHS: "/templates/default.tmpl"
+    volumes:
+      - alertmanager_bot_data:/data
+    networks: [ops-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: kidzpos-node-exporter
+    restart: always
+    pid: host  # accès aux stats système host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    ports:
+      - "9100:9100"
+    networks: [ops-net]
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: kidzpos-postgres-exporter
+    restart: always
+    # network_mode: host est REQUIS quand Postgres écoute uniquement sur 127.0.0.1
+    # (cas par défaut Arch et configs sécurisées). Sinon l'exporter ne peut PAS
+    # joindre la DB via host.docker.internal (refusé car listen_addresses=localhost).
+    #
+    # Conséquence : port 9187 directement sur l'hôte, pas dans ops-net.
+    # Prometheus le scrape via host.docker.internal:9187 (cf prometheus.yml).
+    #
+    # ALTERNATIVE plus propre : modifier postgresql.conf →
+    #   listen_addresses = '*'
+    # + pg_hba.conf qui n'autorise que 172.17.0.0/16 → puis revenir au mode
+    # networks: [ops-net] classique. À privilégier si Postgres est managé
+    # via Docker aussi (déploiement multi-host).
+    network_mode: host
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${PG_USER:-kidzpos}:${PG_PASSWORD:-kidzpos}@127.0.0.1:${PG_PORT:-5432}/${PG_DB:-kidzpos}?sslmode=disable"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9187/metrics || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

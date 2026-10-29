@@ -1,0 +1,358 @@
+# ops/prometheus/alerts.yml — Règles d'alerte KidzPOS.
+#
+# Chaque alerte a :
+#   severity   : critical (P0, réveil opérateur) | warning (P1, mail/groupé)
+#   summary    : titre court visible dans Alertmanager
+#   description: contexte + runbook path
+#
+# Convention : runbook_url pointe vers /ops/runbooks/<nom>.md
+
+groups:
+  - name: kidzpos.availability
+    rules:
+      - alert: BackendDown
+        expr: up{job="kidzpos-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend KidzPOS injoignable depuis 2 min"
+          description: |
+            Le scrape /actuator/prometheus échoue. Caisses passent en mode offline,
+            ventes enfilées dans l'outbox local. Vérifier process Java + DB.
+          runbook_url: "file:///ops/runbooks/incident_backend_down.md"
+
+      - alert: DBDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL injoignable depuis 1 min"
+          description: |
+            postgres-exporter n'arrive plus à se connecter. Le backend est probablement
+            en train de cascade-fail. Vérifier service postgres + disque + connexion réseau.
+          runbook_url: "file:///ops/runbooks/db_down.md"
+
+      - alert: PrometheusTargetMissing
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cible Prometheus {{ $labels.instance }} ({{ $labels.job }}) absente"
+          description: "Pas de scrape réussi depuis 5 min — vérifier service ou réseau."
+
+      - alert: SseBusDown
+        # Le SseHealthIndicator passe à 0 dès que le dernier broadcast date de
+        # plus de 90s (3× la période heartbeat de 30s). Source de vérité côté
+        # backend : cf SseHealthIndicator + EventBus.startHeartbeat.
+        expr: kidzpos_sse_bus_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Bus SSE bloqué — diffusion temps réel KO depuis ≥ 90s"
+          description: |
+            Le scheduler heartbeater du backend ne tick plus. Conséquences :
+            les caisses ne reçoivent plus les events 'change' temps réel et
+            vont déclencher leur zombie detection (front : 90s). Elles
+            continuent à fonctionner via le polling du backend watcher (30s)
+            mais l'UX temps réel est cassée.
+            Vérifier : thread "sse-heartbeat" vivant + GC pause + deadlock.
+          runbook_url: "file:///ops/runbooks/sse_bus_down.md"
+
+      - alert: SseBusBroadcastStale
+        # Alerte anticipée — avant que bus_up ne tombe à 0 (90s), on prévient
+        # à partir de 60s sans broadcast. Permet d'investiguer un ralentissement
+        # avant qu'il devienne critique.
+        # NB : suffixe _seconds ajouté par Micrometer (convention Prometheus
+        # pour les gauges avec baseUnit("seconds")).
+        expr: kidzpos_sse_seconds_since_last_broadcast_seconds > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Heartbeat SSE en retard (> 60s) depuis 2 min"
+          description: |
+            Le tick du scheduler heartbeater devrait passer toutes les 30s.
+            S'il dérive à > 60s sur 2 min consécutives, le scheduler est
+            probablement saturé (GC, threads bloqués). À surveiller avant
+            qu'il ne tombe en SseBusDown critique.
+
+  - name: kidzpos.quality
+    rules:
+      - alert: HighBackend5xxRate
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{job="kidzpos-backend",status=~"5.."}[5m]))
+            /
+            sum(rate(http_server_requests_seconds_count{job="kidzpos-backend"}[5m]))
+          ) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Taux d'erreurs 5xx > 5% sur 5 min"
+          description: |
+            Le backend renvoie >5% d'erreurs serveur. Les caisses entrent en DEGRADED.
+            Vérifier logs Spring + santé DB + ressources host.
+          runbook_url: "file:///ops/runbooks/high_5xx_or_latency.md"
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_server_requests_seconds_bucket{job="kidzpos-backend"}[5m]))
+          ) > 1.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Latence p95 > 1.5s sur 5 min"
+          description: |
+            Le backend ralentit. Si soutenu, déclenche DEGRADED côté caisses (rps=2, batch=1).
+            Vérifier DB locks + GC pause + saturation CPU.
+          runbook_url: "file:///ops/runbooks/high_5xx_or_latency.md"
+
+  - name: kidzpos.business
+    rules:
+      - alert: OutboxSaturation
+        expr: kidzpos_frontend_outbox_size > 8000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox saturée (>8000) depuis 10 min"
+          description: |
+            Au moins une caisse approche le HARD_LIMIT 10000. Au-delà, le drain est
+            mis en pause et de nouvelles ventes risquent l'éviction FIFO à 12000.
+          runbook_url: "file:///ops/runbooks/outbox_saturation.md"
+
+      - alert: FailedReplaysRising
+        expr: kidzpos_frontend_failed_replays > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mutations rejetées (4xx) en attente d'acquittement"
+          description: |
+            Des mutations sont entrées dans failedReplays — l'opérateur doit consulter
+            le badge "N échec(s)" dans l'UI et acquitter/recommencer.
+
+      - alert: ReplayStuckInDegraded
+        expr: kidzpos_frontend_replay_mode_max == 2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replay en DEGRADED depuis 15 min"
+          description: |
+            Au moins une caisse n'arrive pas à sortir du mode dégradé. Backend instable
+            ou réseau saturé. Vérifier corrélation avec HighBackend5xxRate.
+          runbook_url: "file:///ops/runbooks/high_5xx_or_latency.md"
+
+      - alert: NoReportingCashier
+        expr: kidzpos_frontend_reporting_cashiers == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aucune caisse ne reporte depuis 15 min"
+          description: |
+            Soit toutes les caisses sont éteintes (heure de fermeture), soit problème
+            d'auth / réseau qui empêche /api/metrics/frontend. Vérifier business hours.
+
+  - name: kidzpos.sync
+    rules:
+      # Lag de sync côté store : âge du plus vieux operation_log avec synced=false.
+      # 0 en régime nominal. Au-delà de 5 min, le central est probablement
+      # injoignable ou a un problème — les ventes ne remontent plus vers
+      # l'agrégateur. Toujours mesuré côté magasin (le central, lui, reste à 0).
+      - alert: SyncLagHigh
+        expr: kidzpos_sync_lag_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sync lag > 5 min sur {{ $labels.instance }}"
+          description: |
+            Le plus vieux event de operation_log non syncé date de plus de 5 min.
+            Le push vers le central n'aboutit pas. Causes typiques :
+              - central injoignable (firewall, DNS, panne réseau)
+              - X-Sync-Api-Key invalide ou expiré
+              - central retourne 5xx persistant
+            Vérifier les logs [sync-push] côté store + dashboard SyncBackend.
+          runbook_url: "file:///ops/runbooks/sync_lag_critical.md"
+
+      - alert: SyncLagCritical
+        expr: kidzpos_sync_lag_seconds > 1800
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sync lag CRITIQUE > 30 min sur {{ $labels.instance }}"
+          description: |
+            Plus de 30 min de retard de sync : risque réel de perte de ventes
+            en cas de panne du store (DB locale = source de vérité unique).
+            Intervention immédiate requise.
+          runbook_url: "file:///ops/runbooks/sync_lag_critical.md"
+
+      # Ratio d'erreurs anormalement haut sur le inbox processor : signal qu'un
+      # handler ou un type d'event diverge (schema drift, payload invalide,
+      # bug applicatif côté magasin émetteur). On compare errored vs total traité
+      # par type, sur fenêtre glissante 10 min, taux > 20%.
+      - alert: SyncInboxErrorRateHigh
+        expr: |
+          (
+            sum by (type) (rate(kidzpos_sync_inbox_errored_total[10m]))
+            /
+            (
+              sum by (type) (rate(kidzpos_sync_inbox_applied_total[10m]))
+              + sum by (type) (rate(kidzpos_sync_inbox_errored_total[10m]))
+              + 1e-9
+            )
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sync inbox: >20% d'erreurs sur type={{ $labels.type }}"
+          description: |
+            Le handler '{{ $labels.type }}' échoue sur >20% des events depuis 10 min.
+            Cas typiques : payload corrompu côté émetteur, schema drift entre stores,
+            bug applicatif dans le handler. Inspecter sync_inbox WHERE type='{{ $labels.type }}'
+            AND processed=false ORDER BY retry_count DESC.
+          runbook_url: "file:///ops/runbooks/sync_inbox_errors.md"
+
+      # Pic de quarantine : au-delà de MAX_RETRIES (5) ou no-handler, un event est
+      # déplacé vers quarantine_events. Plus de 3 quarantines par type en 10 min
+      # signale soit un type non whitelisté (nouveau handler à déployer), soit un
+      # event empoisonné qui ne sera jamais traité.
+      - alert: SyncInboxQuarantineSpike
+        expr: sum by (type) (increase(kidzpos_sync_inbox_quarantined_total[10m])) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sync inbox: >3 quarantaines de type={{ $labels.type }} en 10 min"
+          description: |
+            Des events '{{ $labels.type }}' atteignent la quarantine_events.
+            Causes possibles :
+              - type non whitelisté (handler manquant côté store récepteur)
+              - dépasse MAX_RETRIES=5 (event poison à investiguer)
+            Action : SELECT * FROM quarantine_events WHERE event_type='{{ $labels.type }}'
+            ORDER BY created_at DESC LIMIT 10. Replay via POST /api/sync/quarantine/{id}/replay
+            après correction.
+          runbook_url: "file:///ops/runbooks/sync_inbox_errors.md"
+
+  - name: kidzpos.backup
+    rules:
+      # T8 — Off-site backup en retard (>36h). Le cron est quotidien 02h ;
+      # 36h tolère un loupé occasionnel. Si soutenu, risque réel de perte
+      # totale en cas de crash disque du store.
+      - alert: OffsiteBackupStale
+        expr: |
+          (time() - kidzpos_backup_offsite_last_success_timestamp_seconds) > 129600
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup off-site en retard de plus de 36h"
+          description: |
+            Le dernier offsite_sync.sh réussi date de > 36h. Si le store crashe,
+            perte de toutes les ventes depuis. Vérifier cron + connectivité NAS/S3.
+
+      # T8 — Off-site backup totalement absent (métrique jamais vue).
+      # Détecté via absent() : aucune série kidzpos_backup_offsite_*.
+      - alert: OffsiteBackupMissing
+        expr: absent(kidzpos_backup_offsite_last_success_timestamp_seconds)
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aucune métrique de backup off-site depuis 24h"
+          description: |
+            Soit offsite_sync.sh n'est pas configuré (BACKUP_OFFSITE_KIND vide),
+            soit textfile collector node_exporter mal configuré. Configurer
+            BACKUP_OFFSITE_KIND/DEST puis cron, sinon données du store NON
+            répliquées hors machine.
+
+      # T9 — Test restore raté ou en retard (>10j). Le cron est hebdo dim 03h.
+      - alert: BackupRestoreTestStale
+        expr: |
+          (time() - kidzpos_backup_restore_test_last_success_timestamp_seconds) > 864000
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Test de restore raté ou absent depuis 10j"
+          description: |
+            Le dernier test_restore.sh réussi date de > 10j. Le backup peut être
+            illisible/incomplet sans qu'on le sache. Vérifier cron + logs récents.
+
+      - alert: BackupRestoreTestDrift
+        expr: kidzpos_backup_restore_test_drift_tables > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Restore drift: {{ $value }} table(s) divergent vs prod"
+          description: |
+            Une ou plusieurs tables ont un row count restore < prod -5%.
+            Soit le dump est trop ancien (RPO dépassé), soit corruption.
+            Investiguer logs test_restore.sh + relancer manuel.
+
+  - name: kidzpos.security
+    rules:
+      - alert: RefreshTokenReuse
+        expr: increase(kidzpos_auth_refresh_reuse_detected_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "⚠ Refresh token réutilisé après révocation (vol suspecté)"
+          description: |
+            Un cookie refresh déjà révoqué a été présenté. Tous les tokens de l'user
+            ont été cascade-revoked. Vérifier logs `cascadedRevoke=N userId=...` et
+            considérer un reset password.
+          runbook_url: "file:///ops/runbooks/refresh_failure.md"
+
+      - alert: LoginRateLimited
+        expr: increase(kidzpos_login_rate_limited_total[5m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "5+ logins rate-limited en 5 min"
+          description: |
+            Possible bruteforce contre /api/auth/login. Identifier IP via logs
+            backend (filtre 429 dans access.log).
+
+      - alert: HighRefreshFailureRate
+        expr: |
+          (
+            rate(kidzpos_auth_refresh_failure_total[5m])
+            /
+            (rate(kidzpos_auth_refresh_success_total[5m]) + rate(kidzpos_auth_refresh_failure_total[5m]))
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: ">50% des refreshs échouent depuis 10 min"
+          description: |
+            Beaucoup de tentatives de refresh sans cookie ou cookie invalide.
+            Soit un client bugué soit une attaque. Inspecter les ip dans backend.log.
+          runbook_url: "file:///ops/runbooks/refresh_failure.md"
+
+      - alert: OptimisticLockConflictSpike
+        expr: increase(kidzpos_optimistic_lock_conflict_total[5m]) > 10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "10+ conflits optimistic lock en 5 min"
+          description: |
+            Plusieurs caisses éditent les mêmes produits simultanément. Possible
+            problème de coordination ou comportement utilisateur inhabituel.
+          runbook_url: "file:///ops/runbooks/optimistic_lock_spike.md"

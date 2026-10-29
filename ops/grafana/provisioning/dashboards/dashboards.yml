@@ -1,0 +1,16 @@
+# Provisioning dashboards : Grafana charge automatiquement tous les .json du
+# dossier /var/lib/grafana/dashboards (monté depuis ops/grafana/dashboards).
+
+apiVersion: 1
+
+providers:
+  - name: KidzPOS
+    orgId: 1
+    folder: KidzPOS
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true   # permet aux opérateurs d'éditer + tester ; rebase via fichier
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

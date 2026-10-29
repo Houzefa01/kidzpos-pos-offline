@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Caddyfile — Reverse proxy HTTPS pour un nœud KidzPOS (central OU store).
+#
+# Un SEUL processus Caddy par nœud, paramétré via variables d'env. Le frontend
+# (dist-*) et l'API (Spring) sont servis sous la MÊME origine HTTPS → plus de
+# CORS, cookies Secure=true + SameSite=Lax.
+#
+# Variables d'env (toutes ont un défaut) :
+#   KIDZPOS_HTTPS_ADDRS    adresses (host:port) à servir, séparées par virgule
+#                          ex : "https://localhost:8443, https://192.168.43.48:8443"
+#                          ⚠ `tls internal` n'émet de cert QUE pour ces hôtes.
+#   KIDZPOS_BACKEND_PORT   port du backend Spring (loopback) (central=8080, store=8081)
+#   KIDZPOS_DIST_DIR       dossier dist du frontend (dist-central ou dist-store)
+#   KIDZPOS_CADDY_LOG      chemin du log d'accès
+#
+# Certificat : `tls internal` → CA locale Caddy. Premier run installe la CA
+# dans le trust store système (peut demander sudo). Pour les machines clientes
+# LAN, copier le root cert : ~/.local/share/caddy/pki/authorities/local/root.crt
+# (voir README § HTTPS).
+#
+# SSE : `flush_interval -1` désactive le buffering → le flux d'events temps réel
+# passe sans latence. `read_timeout 24h` évite la coupure de connexions longues.
+# ─────────────────────────────────────────────────────────────────────────────
+{
+	admin off
+	auto_https disable_redirects
+	persist_config off
+}
+
+{$KIDZPOS_HTTPS_ADDRS:https://localhost:443} {
+	tls internal
+
+	encode gzip zstd
+
+	# ── API REST + handshake SSE + flux SSE ─────────────────────────────────
+	handle /api/* {
+		reverse_proxy 127.0.0.1:{$KIDZPOS_BACKEND_PORT:8080} {
+			flush_interval -1
+			transport http {
+				read_timeout 24h
+				write_timeout 24h
+			}
+		}
+	}
+
+	# ── Actuator (health, prometheus) ──────────────────────────────────────
+	handle /actuator/* {
+		reverse_proxy 127.0.0.1:{$KIDZPOS_BACKEND_PORT:8080}
+	}
+
+	# ── OpenAPI / Swagger ──────────────────────────────────────────────────
+	handle /v3/api-docs* {
+		reverse_proxy 127.0.0.1:{$KIDZPOS_BACKEND_PORT:8080}
+	}
+	handle /swagger-ui* {
+		reverse_proxy 127.0.0.1:{$KIDZPOS_BACKEND_PORT:8080}
+	}
+
+	# ── Frontend statique + SPA fallback ───────────────────────────────────
+	handle {
+		root * {$KIDZPOS_DIST_DIR}
+		try_files {path} /index.html
+		file_server
+
+		@index path / /index.html
+		header @index Cache-Control "no-cache"
+
+		@hashed path_regexp /assets/.*\.(js|css|woff2?|svg|png|jpg|jpeg|webp|ico)$
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	log {
+		output file {$KIDZPOS_CADDY_LOG:./caddy.log}
+		format console
+	}
+}

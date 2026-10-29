@@ -1,0 +1,54 @@
+# ops/prometheus/prometheus.yml
+#
+# Scrape KidzPOS backend (host), Postgres exporter (host via container),
+# Node exporter (container), Prometheus self.
+#
+# Intervalle scrape : 5s (dev). Pour prod, passer à 15s (cf preset commenté).
+
+global:
+  scrape_interval: 5s          # dev. PROD : 15s
+  scrape_timeout: 4s           # PROD : 10s
+  evaluation_interval: 10s     # période d'éval des règles d'alerte
+
+# Rules : routées dans alertmanager via le bloc alerting:
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: kidzpos-backend
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service: kidzpos
+          env: lan
+    # Le endpoint est permitAll (cf SecurityConfig P0), pas d'auth requise
+    # En prod publique via reverse-proxy → restreindre au CIDR Prometheus
+    # côté Caddy/nginx, pas ici.
+
+  - job_name: postgres
+    static_configs:
+      # postgres-exporter tourne en --network=host pour contacter 127.0.0.1:5432
+      # quand Postgres n'écoute que sur localhost (cas par défaut Arch / config
+      # strict). On le scrape via l'hôte, pas via alias DNS dans ops-net.
+      - targets: ["host.docker.internal:9187"]
+        labels:
+          service: postgres
+          env: lan
+
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          service: host
+          env: lan

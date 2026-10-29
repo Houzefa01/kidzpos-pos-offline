@@ -1,0 +1,202 @@
+server:
+  port: ${SERVER_PORT:8080}
+  address: 0.0.0.0       # écoute sur toutes les interfaces (LAN)
+  # Compression gzip sur les payloads JSON : gain typique ×5 à ×10 sur les
+  # responses /api/products et /api/sales (texte JSON très compressible).
+  # min-response-size évite la compression sur les petites réponses (overhead
+  # du framing gzip > gain). 1 KB = seuil standard.
+  compression:
+    enabled: true
+    # ⚠ NE PAS inclure text/event-stream : gzip bufferise et casse le streaming
+    # temps réel des SSE (heartbeat + change events). Tomcat respecte ce filtrage.
+    mime-types: application/json
+    min-response-size: 1024
+  # P2.2 : derrière un reverse-proxy (Caddy/nginx), Tomcat lit X-Forwarded-For
+  # et expose la VRAIE IP cliente via req.getRemoteAddr() — utilisé par
+  # LoginRateLimitFilter et RefreshRateLimitFilter. NATIVE n'accepte les headers
+  # que depuis les proxies locaux par défaut (cf server.tomcat.remoteip.*).
+  forward-headers-strategy: native
+  tomcat:
+    accesslog:
+      enabled: true
+      # Tomcat résout les chemins relatifs depuis catalina.base (tmp dir Spring Boot
+      # embarqué), pas depuis le CWD. ./logs reste utilisable et reste à côté du
+      # JAR sur la plupart des déploiements (start-server.sh crée ce dossier).
+      # Pour forcer un chemin absolu en prod (/var/log/kidzpos, etc.), exporter
+      # TOMCAT_ACCESSLOG_DIR — start-server.sh le fait déjà avec un absolu.
+      directory: ${TOMCAT_ACCESSLOG_DIR:./logs}
+      prefix: access
+      suffix: .log
+      buffered: false           # flush immédiat pour monitoring temps réel
+      pattern: '%t %a "%r" %s %b %D ms'
+      rotate: false
+
+spring:
+  application:
+    name: kidzpos-backend
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:kidzpos}
+    username: ${DB_USER:kidzpos}
+    password: ${DB_PASSWORD:kidzpos}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate  # Use Flyway for schema management, not Hibernate auto-ddl
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    baseline-on-migrate: true  # Allow migration on existing schema
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # prometheus exposé pour scraping ; metrics utile pour debug ; health pour LB.
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      # never : payload public limité à {status: UP|DOWN} → safe pour le LB.
+      # when_authorized : payload détaillé (DB, Flyway, SSE bus subscribers, etc.)
+      # exposé UNIQUEMENT aux utilisateurs porteurs d'un JWT valide (cf JwtAuthFilter).
+      # En LAN HTTP la frontière auth est l'unique barrière — pas de leak public.
+      show-details: when_authorized
+      # Affiche systématiquement chaque composant (DB, Flyway, sseBus, …) dans le payload
+      # détaillé, même quand l'agrégat est UP. Aide à diagnostiquer "lequel parmi N est down".
+      show-components: when_authorized
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+logging:
+  level:
+    # Silence "Broken pipe" qui spamme à chaque déconnexion SSE (comportement normal)
+    "[org.apache.catalina.core.ContainerBase.[Catalina].[localhost].[/].[dispatcherServlet]]": OFF
+    org.springframework.web.servlet.handler.HandlerExceptionResolver: ERROR
+    # Silence "Failure in @ExceptionHandler" pour les broken pipes SSE (cf GlobalExceptionHandler)
+    "[org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver]": ERROR
+
+# springdoc-openapi : la spec /v3/api-docs reste exposée (consommée par
+# openapi-typescript pour la génération des types frontend, cf gen:api-types).
+# Swagger UI désactivée par défaut — l'activer en dev via :
+#   SPRINGDOC_SWAGGER_UI_ENABLED=true
+springdoc:
+  api-docs:
+    enabled: true
+    path: /v3/api-docs
+  swagger-ui:
+    enabled: ${SPRINGDOC_SWAGGER_UI_ENABLED:false}
+    path: /swagger-ui.html
+  # Limite la génération aux endpoints applicatifs (exclut /actuator/**).
+  paths-to-match: /api/**
+
+kidzpos:
+  jwt:
+    # P1.2 : pas de défaut. Le backend refuse de démarrer si JWT_SECRET est absent
+    # ou < 32 octets (cf JwtService). Générer avec : openssl rand -base64 48
+    # En dev/test, application-test.yml fournit une clé valide.
+    secret: ${JWT_SECRET:}
+    # expiration-hours est conservé pour rétrocompat ; access-token-minutes prend
+    # la précédence si défini. Recommandation P2 : 15 minutes.
+    expiration-hours: 0
+  auth:
+    access-token-minutes: ${KIDZPOS_ACCESS_TOKEN_MINUTES:15}
+    refresh-token-days: ${KIDZPOS_REFRESH_TOKEN_DAYS:30}
+    # Cookie refresh httpOnly :
+    #   cookie-secure  : false en LAN HTTP ; TRUE obligatoire en HTTPS prod
+    #   cookie-same-site : Lax (LAN), Strict (prod same-origin), None (cross-origin HTTPS)
+    cookie-secure: ${KIDZPOS_AUTH_COOKIE_SECURE:false}
+    cookie-same-site: ${KIDZPOS_AUTH_COOKIE_SAME_SITE:Lax}
+  # ─── Rate limiting (T5) ───────────────────────────────────────────────────
+  # Calibrable sans recompile. Defaults conservatifs pour LAN mono-backend.
+  # En multi-instance, migrer vers un store partagé (Redis/bucket4j-redis).
+  ratelimit:
+    login:
+      limit: ${KIDZPOS_RATELIMIT_LOGIN_LIMIT:5}
+      window-ms: ${KIDZPOS_RATELIMIT_LOGIN_WINDOW_MS:300000}      # 5 min
+    refresh:
+      limit: ${KIDZPOS_RATELIMIT_REFRESH_LIMIT:10}
+      window-ms: ${KIDZPOS_RATELIMIT_REFRESH_WINDOW_MS:60000}     # 1 min
+    sync:
+      # Push 30s × batch 200 ops = ~2 req/min ; 120 req/min laisse une marge
+      # confortable pour les bursts et le pull paginé.
+      limit: ${KIDZPOS_RATELIMIT_SYNC_LIMIT:120}
+      window-ms: ${KIDZPOS_RATELIMIT_SYNC_WINDOW_MS:60000}        # 1 min
+  cors:
+    # Patterns autorisés (localhost + IPs LAN privées sur ports Vite/preview, HTTP + HTTPS).
+    # ⚠️ En prod derrière Caddy/nginx HTTPS : exporter CORS_ALLOWED_ORIGINS=https://kidzpos.monshop.com
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,https://localhost:5173,http://localhost:4173,http://localhost:8080,http://127.0.0.1:5173,http://127.0.0.1:4173,http://192.168.*.*:5173,https://192.168.*.*,http://192.168.*.*:4173,http://10.*.*.*:5173,https://10.*.*.*,http://10.*.*.*:4173,http://172.16.*.*:5173,http://172.17.*.*:5173,http://172.18.*.*:5173,http://172.19.*.*:5173,http://172.20.*.*:5173,http://172.21.*.*:5173,http://172.22.*.*:5173,http://172.23.*.*:5173,http://172.24.*.*:5173,http://172.25.*.*:5173,http://172.26.*.*:5173,http://172.27.*.*:5173,http://172.28.*.*:5173,http://172.29.*.*:5173,http://172.30.*.*:5173,http://172.31.*.*:5173}
+  exchange:
+    # Taux EUR -> Ariary par défaut (mis à jour si internet via /api/exchange/refresh)
+    eur-to-ar-default: 4900
+  # ─── Listings cap (T3 — audit-2026-05) ────────────────────────────────────
+  # GET /api/sales sans `?page=` retourne max N ventes (date DESC). Au-delà,
+  # le client DOIT paginer. Protège contre le runaway "100k ventes = 100 Mo
+  # JSON = OOM frontend". 2000 = ~6 mois pour un magasin moyen.
+  sales:
+    list-default-cap: ${KIDZPOS_SALES_LIST_DEFAULT_CAP:2000}
+  # ─── Synchronisation local ↔ central ───────────────────────────────────────
+  # Par défaut DÉSACTIVÉE → SyncPushService + SyncScheduler ne sont même pas
+  # instanciés (cf @ConditionalOnProperty). Le central, lui, accepte les push
+  # tant que /api/sync/push est appelable (auth ADMIN ou X-Sync-Api-Key).
+  #
+  # Activation côté magasin : kidzpos.sync.push.enabled=true (cf application-local.yml).
+  # Le central garde push.enabled=false : il ne push vers personne, il reçoit.
+  sync:
+    push:
+      enabled: ${KIDZPOS_SYNC_PUSH_ENABLED:false}
+      central-url: ${KIDZPOS_SYNC_CENTRAL_URL:}
+      api-key: ${KIDZPOS_SYNC_API_KEY:}
+      batch-size: ${KIDZPOS_SYNC_BATCH_SIZE:20}
+      timeout-ms: ${KIDZPOS_SYNC_TIMEOUT_MS:3000}
+      interval-ms: ${KIDZPOS_SYNC_INTERVAL_MS:30000}
+      initial-delay-ms: ${KIDZPOS_SYNC_INITIAL_DELAY_MS:10000}
+      # ── Retry à backoff exponentiel (cf SyncPushService) ─────────────────
+      # base-backoff-ms : délai après le 1er échec d'un item (= 1 tick par défaut)
+      # max-backoff-ms  : plafond (les essais subséquents ne dépassent pas)
+      # max-attempts    : 0 = illimité soft (jamais frozen). >0 = au-delà, l'item
+      #                   reste en base avec synced=false mais n'est plus retenté
+      #                   (FROZEN) — nécessite intervention manuelle.
+      retry:
+        base-backoff-ms: ${KIDZPOS_SYNC_RETRY_BASE_MS:30000}
+        max-backoff-ms: ${KIDZPOS_SYNC_RETRY_MAX_MS:600000}
+        max-attempts: ${KIDZPOS_SYNC_RETRY_MAX_ATTEMPTS:0}
+    # ─── Pull central → local ────────────────────────────────────────────────
+    # Désactivé par défaut. Les beans SyncPullService + SyncPullScheduler ne
+    # sont créés que si enabled=true → ZÉRO impact runtime sans cette propriété.
+    # Activé par défaut sur le profil local (cf application-local.yml).
+    # Le central n'a aucune raison d'activer pull (il N'a personne au-dessus).
+    #
+    # central-url + api-key partagent les mêmes vars d'env que push (un seul
+    # serveur central, un seul secret partagé) — override possible si besoin.
+    pull:
+      enabled: ${KIDZPOS_SYNC_PULL_ENABLED:false}
+      central-url: ${KIDZPOS_SYNC_CENTRAL_URL:}
+      api-key: ${KIDZPOS_SYNC_API_KEY:}
+      batch-size: ${KIDZPOS_SYNC_PULL_BATCH_SIZE:100}
+      timeout-ms: ${KIDZPOS_SYNC_PULL_TIMEOUT_MS:5000}
+      interval-ms: ${KIDZPOS_SYNC_PULL_INTERVAL_MS:60000}
+      initial-delay-ms: ${KIDZPOS_SYNC_PULL_INITIAL_DELAY_MS:15000}
+    # Clé attendue côté central pour authentifier les push entrants.
+    # Vide → l'authentification par API-KEY est désactivée (seul JWT ADMIN passe).
+    inbound:
+      api-key: ${KIDZPOS_SYNC_INBOUND_API_KEY:}
+    # ─── Application des événements sync_inbox → métier local ────────────────
+    # Désactivé par défaut. SyncInboxProcessor + SyncInboxScheduler ne sont créés
+    # que si enabled=true. Activé par défaut sur le profil local (cf application-local.yml).
+    #
+    # WHITELIST = ensemble des @Component InboxHandler chargés. Aujourd'hui :
+    #   product.created, product.updated, stock.adjusted
+    # Tout type hors whitelist → la ligne reste à processed=false avec un WARN
+    # (ne bloque pas le reste du batch).
+    inbox:
+      enabled: ${KIDZPOS_SYNC_INBOX_ENABLED:false}
+      batch-size: ${KIDZPOS_SYNC_INBOX_BATCH_SIZE:50}
+      interval-ms: ${KIDZPOS_SYNC_INBOX_INTERVAL_MS:60000}
+      initial-delay-ms: ${KIDZPOS_SYNC_INBOX_INITIAL_DELAY_MS:20000}
