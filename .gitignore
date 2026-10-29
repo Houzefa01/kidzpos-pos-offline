@@ -31,3 +31,7 @@ target/
 !.vscode/extensions.json
 yarn-debug.log*
 yarn-error.log*
+
+# Fichiers d’assistant IA (locaux)
+CLAUDE.md
+.claude/
